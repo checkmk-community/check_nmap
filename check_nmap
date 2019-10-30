@@ -1,0 +1,108 @@
+#!/bin/bash
+# Script: check_nmap
+# Description: Check_MK agent plugin that performs NMAP scans agains hosts and
+#              compares the list of open ports with the configured whitelist.
+# Author: Brian Wiborg <brian@flux.fail>
+# Date: 2019-10-30
+
+# CONFIG_DIR defines the configuration directory. Each file in this directory
+# is treated as configuration file. The filename of each configuration file
+# defines the hostname or IP address to scan, while the lines inside each
+# configuration file define the list of the allowed ports.
+#
+# Example:
+# - scan 127.0.0.1 and whitelist the web-ports:
+#   file: `$CONFIG_DIR/127.0.0.1` contains the lines
+#         80/tcp
+#         443/tcp
+# - scan example.com and allow only SSH:
+#   file: `$CONFIG_DIR/example.com` contains the line
+#         22/tcp
+#
+CONFIG_DIR="/etc/check_mk/agent/nmap"
+
+# Check status-levels:
+STATUS_UNEXPECTED_OPEN="2"
+STATUS_UNEXPECTED_CLOSED="1"
+
+# Messages:
+MSG_CRIT="CRIT - Found open port!"
+MSG_WARN="WARN - Seems down or blocked."
+MSG_OK="OK - Last scan result $(date)"
+
+# create configuration directory if not exists
+if [[ ! -d "$CONFIG_DIR" ]]; then
+  mkdir -p "$CONFIG_DIR"
+  chmod 750 "$CONFIG_DIR"
+fi
+
+# function: nmap_scan
+# Takes a hostname/IP as first argument and performs a prepared NMAP scan
+# against it.
+nmap_scan() {
+  target="${1}"
+  nmap -n -Pn -sT "${target}" |\
+    tail -n+6 |\
+    head -n-2 |\
+    awk '{ print $1 }' |\
+    sort -n
+}
+
+# set nullglob to avoid side-effects when no configuration file exists
+shopt -s nullglob
+
+# both below associative arrays use the hostname/IP address as their 'key' item
+declare -A SCANS    # will contain the scan results
+declare -A TARGETS  # will contain the configured whitelists
+
+# fill up $TARGETS with all available configuration files
+for target in "$CONFIG_DIR"/*; do
+  name="$(basename "${target}")"
+  TARGETS["${name}"]="$(cat "${target}" | sort -n)"
+done
+
+# fill up SCANS by scanning each configured target
+for target in "${!TARGETS[@]}"; do
+  SCANS["${target}"]="$(nmap_scan ${target})"
+done
+
+# run all targets and their corresponding scan results through an algorithm that
+# compares the scan results with the configured whitelist and produces a
+# human-readable report line.
+check_snmp() {
+  declare -a open_ports_unexpected
+  declare -a closed_ports_unexpected
+
+  target="${1}"
+  IFS=$'\n'
+  allowed_ports=( ${2} )
+  open_ports=( ${3} )
+  unset IFS
+
+  # find unexpectedly open ports
+  for p in "${open_ports[@]}"; do
+    if [[ ! "${allowed_ports[@]}" =~ "${p}" ]]; then
+      open_ports_unexpected+=( "${p}" )
+    fi
+  done
+  # find unexpectedly closed ports
+  for p in "${allowed_ports[@]}"; do
+    if [[ ! "${open_ports[@]}" =~ "${p}" ]]; then
+      closed_ports_unexpected+=( "${p}" )
+    fi
+  done
+
+  name="scan.nmap.${target}"
+  details="\\nOpen but not whitelisted: ${open_ports_unexpected[@]}\\nWhitelisted but not open: ${closed_ports_unexpected[@]}"
+
+  if [[ ${#open_ports_unexpected[@]} > 0 ]]; then
+    echo "${STATUS_UNEXPECTED_OPEN} ${name} monitored=${#open_ports[@]} ${MSG_CRIT}${details}"
+  elif [[ ${#closed_ports_unexpected[@]} > 0 ]]; then
+    echo "${STATUS_UNEXPECTED_CLOSED} ${name} monitored=${#open_ports[@]} ${MSG_WARN}${details}"
+  else
+    echo "0 ${name} monitored=${#open_ports[@]} ${MSG_OK}"
+  fi
+}
+for target in "${!TARGETS[@]}"; do
+  check_snmp "${target}" "${TARGETS[${target}]}" "${SCANS[$target]}"
+done
